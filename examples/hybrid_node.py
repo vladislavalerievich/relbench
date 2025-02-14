@@ -9,6 +9,8 @@ from typing import Dict
 import numpy as np
 import torch
 import torch_frame
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
 from model import Model
 from text_embedder import GloveTextEmbedding
 from torch.nn import BCEWithLogitsLoss, L1Loss
@@ -26,17 +28,18 @@ from relbench.modeling.utils import get_stype_proposal
 from relbench.tasks import get_task
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--dataset", type=str, default="rel-stackex")
-parser.add_argument("--task", type=str, default="rel-stackex-engage")
+parser.add_argument("--dataset", type=str, default="rel-stack")
+parser.add_argument("--task", type=str, default="user-engagement")
 parser.add_argument("--lr", type=float, default=0.005)
-parser.add_argument("--epochs", type=int, default=10)
+parser.add_argument("--epochs", type=int, default=20)
 parser.add_argument("--batch_size", type=int, default=512)
-parser.add_argument("--channels", type=int, default=128)
-parser.add_argument("--aggr", type=str, default="sum")
-parser.add_argument("--num_layers", type=int, default=2)
+parser.add_argument("--channels", type=int, default=256)
+parser.add_argument("--aggr", type=str, default="mean")
+parser.add_argument("--num_layers", type=int, default=3)
 parser.add_argument("--num_neighbors", type=int, default=128)
 parser.add_argument("--temporal_strategy", type=str, default="uniform")
-parser.add_argument("--max_steps_per_epoch", type=int, default=2000)
+parser.add_argument("--max_steps_per_epoch", type=int, default=1000)
+parser.add_argument("--weight_decay", type=float, default=1e-4)  # Regularization to prevent overfitting
 # If true, try to load pretrained state dict
 parser.add_argument("--attempt_load_state_dict", action="store_true", default=False)
 parser.add_argument(
@@ -45,7 +48,7 @@ parser.add_argument(
 parser.add_argument(
     "--sample_size",
     type=int,
-    default=50_000,
+    default=38_109_828,
     help="Subsample the specified number of training data to train LightGBM model.",
 )
 parser.add_argument("--num_workers", type=int, default=0)
@@ -241,6 +244,17 @@ model = Model(
     norm="batch_norm",
 ).to(device)
 
+# Initialize optimizer
+optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+# Implement Cosine Annealing Learning Rate Scheduler
+scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+
+# Early stopping parameters
+early_stopping_patience = 5  # Stop if no improvement for 5 epochs
+best_val_metric = float('-inf') if higher_is_better else float('inf')
+patience_counter = 0
+
 
 STATE_DICT_PTH = "results/{args.dataset}_{args.task}_state_dict.pth"
 
@@ -258,15 +272,24 @@ else:
         train_loss = train()
         val_pred = test(loader_dict["val"])
         val_metrics = task.evaluate(val_pred, task.get_table("val"))
-        print(
-            f"Epoch: {epoch:02d}, Train loss: {train_loss}, Val metrics: {val_metrics}"
-        )
+        print(f"Epoch: {epoch:02d}, Train loss: {train_loss}, Val metrics: {val_metrics}")
 
-        if (higher_is_better and val_metrics[tune_metric] > best_val_metric) or (
-            not higher_is_better and val_metrics[tune_metric] < best_val_metric
-        ):
+        # Check for improvement
+        if (higher_is_better and val_metrics[tune_metric] > best_val_metric) or \
+                (not higher_is_better and val_metrics[tune_metric] < best_val_metric):
             best_val_metric = val_metrics[tune_metric]
             state_dict = copy.deepcopy(model.state_dict())
+            patience_counter = 0  # Reset patience
+        else:
+            patience_counter += 1
+
+        # Stop early if no improvement
+        if patience_counter >= early_stopping_patience:
+            print("Early stopping triggered.")
+            break
+
+        # Step the scheduler
+        scheduler.step()
 
     # save state dict
     if args.attempt_load_state_dict:
@@ -282,11 +305,11 @@ print("=====================")
 model.load_state_dict(state_dict)
 val_pred = test(loader_dict["val"])
 val_metrics = task.evaluate(val_pred, task.get_table("val"))
-print(f"Best Val metrics: {val_metrics}")
+print(f"GNN Best Val metrics: {val_metrics}")
 
 test_pred = test(loader_dict["test"])
 test_metrics = task.evaluate(test_pred)
-print(f"Best test metrics: {test_metrics}")
+print(f"GNN Best test metrics: {test_metrics}")
 
 
 print("=====================")
@@ -344,7 +367,7 @@ model.tune(tf_train, tf_val, num_trials=10)
 
 pred = model.predict(tf_val).numpy()
 val_metrics = task.evaluate(pred, task.get_table("val"))
-print(f"Val: {val_metrics}")
+print(f"LightGBM Val: {val_metrics}")
 
 pred = model.predict(tf_test).numpy()
-print(f"Test: {test_metrics}")
+print(f"LightGBM Test: {test_metrics}")
