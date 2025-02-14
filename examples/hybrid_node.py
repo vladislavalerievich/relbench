@@ -11,6 +11,10 @@ import torch
 import torch_frame
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
+import optuna
+from optuna.samplers import TPESampler
+from optuna.pruners import HyperbandPruner
+
 from model import Model
 from text_embedder import GloveTextEmbedding
 from torch.nn import BCEWithLogitsLoss, L1Loss
@@ -39,6 +43,7 @@ parser.add_argument("--num_layers", type=int, default=3)
 parser.add_argument("--num_neighbors", type=int, default=128)
 parser.add_argument("--temporal_strategy", type=str, default="uniform")
 parser.add_argument("--max_steps_per_epoch", type=int, default=1000)
+parser.add_argument("--optuna_num_trials", type=int, default=10)
 parser.add_argument("--weight_decay", type=float, default=1e-4)  # Regularization to prevent overfitting
 # If true, try to load pretrained state dict
 parser.add_argument("--attempt_load_state_dict", action="store_true", default=False)
@@ -245,7 +250,14 @@ model = Model(
 ).to(device)
 
 # Initialize optimizer
-optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+optimizer = torch.optim.AdamW(
+    [
+        {"params": model.encoder.parameters(), "lr": args.lr * 0.5},  # Encoder: half LR
+        {"params": model.gnn.parameters(), "lr": args.lr},  # Main GNN
+        {"params": model.head.parameters(), "lr": args.lr * 2},  # Final layers: higher LR
+    ],
+    weight_decay=args.weight_decay,
+)
 
 # Implement Cosine Annealing Learning Rate Scheduler
 scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
@@ -256,7 +268,7 @@ best_val_metric = float('-inf') if higher_is_better else float('inf')
 patience_counter = 0
 
 
-STATE_DICT_PTH = "results/{args.dataset}_{args.task}_state_dict.pth"
+STATE_DICT_PTH = f"results/{args.dataset}_{args.task}_state_dict.pth"
 
 # if state dict exists, load it
 if os.path.exists(STATE_DICT_PTH) and args.attempt_load_state_dict:
@@ -360,14 +372,59 @@ relbench2torch_frame = {
     TaskType.BINARY_CLASSIFICATION: TaskTypeTorchFrame.BINARY_CLASSIFICATION,
     TaskType.REGRESSION: TaskTypeTorchFrame.REGRESSION,
 }
-task_type = relbench2torch_frame[task.task_type]
-model = LightGBM(task_type=task_type, metric=tune_metric)
-model.tune(tf_train, tf_val, num_trials=10)
 
 
-pred = model.predict(tf_val).numpy()
-val_metrics = task.evaluate(pred, task.get_table("val"))
-print(f"LightGBM Val: {val_metrics}")
+def objective(trial):
+    params = {
+        "learning_rate": trial.suggest_float("learning_rate", 1e-4, 0.3, log=True),
+        "num_leaves": trial.suggest_int("num_leaves", 32, 512),
+        "max_depth": trial.suggest_int("max_depth", 3, 16),
+        "min_child_samples": trial.suggest_int("min_child_samples", 5, 200),
+        "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+        "reg_alpha": trial.suggest_float("reg_alpha", 1e-9, 10.0, log=True),
+        "reg_lambda": trial.suggest_float("reg_lambda", 1e-9, 10.0, log=True),
+        "n_estimators": trial.suggest_int("n_estimators", 50, 1000),
+        "max_bin": trial.suggest_int("max_bin", 200, 500),
+    }
 
-pred = model.predict(tf_test).numpy()
-print(f"LightGBM Test: {test_metrics}")
+    # Initialize and train LightGBM with suggested params
+    model = LightGBM(
+        task_type=relbench2torch_frame[task.task_type],
+        metric=tune_metric,
+        **params
+    )
+    model.fit(tf_train, tf_val)
+
+    # Get validation predictions and metrics
+    val_pred = model.predict(tf_val).numpy()
+    val_metrics = task.evaluate(val_pred, task.get_table("val"))
+
+    return val_metrics[tune_metric]
+
+
+# Create Optuna study
+study = optuna.create_study(
+    direction="maximize" if higher_is_better else "minimize",
+    sampler=TPESampler(seed=args.seed),
+    pruner=HyperbandPruner(),
+)
+
+# Run optimization
+study.optimize(objective, n_trials=args.optuna_num_trials, show_progress_bar=True)
+
+# Train final model with best parameters
+best_params = study.best_params
+print(f"Best LightGBM parameters: {best_params}")
+
+final_model = LightGBM(
+    task_type=relbench2torch_frame[task.task_type],
+    metric=tune_metric,
+    **best_params
+)
+final_model.fit(torch_frame.cat([tf_train, tf_val]))  # Combine train+val
+
+# Evaluate LightGBM on test set
+test_pred = final_model.predict(tf_test).numpy()
+test_metrics = task.evaluate(test_pred)
+print(f"LightGBM Best Test metrics: {test_metrics}")
