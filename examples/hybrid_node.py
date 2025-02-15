@@ -11,10 +11,6 @@ import torch
 import torch_frame
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-import optuna
-from optuna.samplers import TPESampler
-from optuna.pruners import HyperbandPruner
-
 from model import Model
 from text_embedder import GloveTextEmbedding
 from torch.nn import BCEWithLogitsLoss, L1Loss
@@ -38,7 +34,7 @@ parser.add_argument("--lr", type=float, default=0.005)
 parser.add_argument("--epochs", type=int, default=20)
 parser.add_argument("--batch_size", type=int, default=512)
 parser.add_argument("--channels", type=int, default=256)
-parser.add_argument("--aggr", type=str, default="mean")
+parser.add_argument("--aggr", type=str, default="sum")
 parser.add_argument("--num_layers", type=int, default=3)
 parser.add_argument("--num_neighbors", type=int, default=128)
 parser.add_argument("--temporal_strategy", type=str, default="uniform")
@@ -53,8 +49,8 @@ parser.add_argument(
 parser.add_argument(
     "--sample_size",
     type=int,
-    default=38_109_828,
-    help="Subsample the specified number of training data to train LightGBM model.",
+    default=50_000,
+    help="Subsample the specified number of training data to train GNN and LightGBM models.",
 )
 parser.add_argument("--num_workers", type=int, default=0)
 parser.add_argument("--seed", type=int, default=42)
@@ -85,7 +81,6 @@ except FileNotFoundError:
     Path(stypes_cache_path).parent.mkdir(parents=True, exist_ok=True)
     with open(stypes_cache_path, "w") as f:
         json.dump(col_to_stype_dict, f, indent=2, default=str)
-
 
 data, col_stats_dict = make_pkey_fkey_graph(
     dataset.get_db(),
@@ -120,6 +115,10 @@ elif task.task_type == TaskType.MULTILABEL_CLASSIFICATION:
 loader_dict: Dict[str, NeighborLoader] = {}
 for split in ["train", "val", "test"]:
     table = task.get_table(split)
+    # For the training split, restrict to the first sample_size rows.
+    if split == "train" and args.sample_size is not None:
+        table.df = table.df.iloc[:args.sample_size].reset_index(drop=True)
+
     table_input = get_node_train_table_input(table=table, task=task)
     entity_table = table_input.nodes[0]
     loader_dict[split] = NeighborLoader(
@@ -196,12 +195,11 @@ def test(loader: NeighborLoader) -> np.ndarray:
 
 @torch.no_grad()
 def embed(
-    model: Model,
-    loader: NeighborLoader,
-    no_label: bool = False,
-    stop_at: int = None,
+        model: Model,
+        loader: NeighborLoader,
+        no_label: bool = False,
+        stop_at: int = None,
 ) -> Dict[str, float]:
-
     # remove model.head from the model
     from torch.nn import Identity
 
@@ -267,7 +265,6 @@ early_stopping_patience = 5  # Stop if no improvement for 5 epochs
 best_val_metric = float('-inf') if higher_is_better else float('inf')
 patience_counter = 0
 
-
 STATE_DICT_PTH = f"results/{args.dataset}_{args.task}_state_dict.pth"
 
 # if state dict exists, load it
@@ -307,7 +304,6 @@ else:
     if args.attempt_load_state_dict:
         torch.save(state_dict, STATE_DICT_PTH)
 
-
 val_pred_accum = 0
 test_pred_accum = 0
 
@@ -322,7 +318,6 @@ print(f"GNN Best Val metrics: {val_metrics}")
 test_pred = test(loader_dict["test"])
 test_metrics = task.evaluate(test_pred)
 print(f"GNN Best test metrics: {test_metrics}")
-
 
 print("=====================")
 print("Embedding performance")
@@ -355,7 +350,6 @@ tf_train = tensor_to_tf(emb_train, y_train)
 tf_val = tensor_to_tf(emb_val, y_val)
 tf_test = tensor_to_tf(emb_test)
 
-
 from torch_frame import TaskType as TaskTypeTorchFrame
 
 # rename tune_metric to  torch-frame Metric format
@@ -366,65 +360,20 @@ if tune_metric == "roc_auc":
 elif tune_metric == "mae":
     tune_metric = Metric.MAE
 
-
 relbench2torch_frame = {
     TaskType.MULTILABEL_CLASSIFICATION: TaskTypeTorchFrame.MULTILABEL_CLASSIFICATION,
     TaskType.BINARY_CLASSIFICATION: TaskTypeTorchFrame.BINARY_CLASSIFICATION,
     TaskType.REGRESSION: TaskTypeTorchFrame.REGRESSION,
 }
 
+task_type = relbench2torch_frame[task.task_type]
+lgbm_model = LightGBM(task_type=task_type, metric=tune_metric)
+lgbm_model.tune(tf_train, tf_val, num_trials=args.optuna_num_trials)
 
-def objective(trial):
-    params = {
-        "learning_rate": trial.suggest_float("learning_rate", 1e-4, 0.3, log=True),
-        "num_leaves": trial.suggest_int("num_leaves", 32, 512),
-        "max_depth": trial.suggest_int("max_depth", 3, 16),
-        "min_child_samples": trial.suggest_int("min_child_samples", 5, 200),
-        "subsample": trial.suggest_float("subsample", 0.5, 1.0),
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-        "reg_alpha": trial.suggest_float("reg_alpha", 1e-9, 10.0, log=True),
-        "reg_lambda": trial.suggest_float("reg_lambda", 1e-9, 10.0, log=True),
-        "n_estimators": trial.suggest_int("n_estimators", 50, 1000),
-        "max_bin": trial.suggest_int("max_bin", 200, 500),
-    }
+pred = lgbm_model.predict(tf_val).numpy()
+val_metrics = task.evaluate(pred, task.get_table("val"))
+print(f"LightGBM Val metrics: {val_metrics}")
 
-    # Initialize and train LightGBM with suggested params
-    model = LightGBM(
-        task_type=relbench2torch_frame[task.task_type],
-        metric=tune_metric,
-        **params
-    )
-    model.fit(tf_train, tf_val)
-
-    # Get validation predictions and metrics
-    val_pred = model.predict(tf_val).numpy()
-    val_metrics = task.evaluate(val_pred, task.get_table("val"))
-
-    return val_metrics[tune_metric]
-
-
-# Create Optuna study
-study = optuna.create_study(
-    direction="maximize" if higher_is_better else "minimize",
-    sampler=TPESampler(seed=args.seed),
-    pruner=HyperbandPruner(),
-)
-
-# Run optimization
-study.optimize(objective, n_trials=args.optuna_num_trials, show_progress_bar=True)
-
-# Train final model with best parameters
-best_params = study.best_params
-print(f"Best LightGBM parameters: {best_params}")
-
-final_model = LightGBM(
-    task_type=relbench2torch_frame[task.task_type],
-    metric=tune_metric,
-    **best_params
-)
-final_model.fit(torch_frame.cat([tf_train, tf_val]))  # Combine train+val
-
-# Evaluate LightGBM on test set
-test_pred = final_model.predict(tf_test).numpy()
+test_pred = lgbm_model.predict(tf_test).numpy()
 test_metrics = task.evaluate(test_pred)
 print(f"LightGBM Best Test metrics: {test_metrics}")
