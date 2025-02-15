@@ -29,7 +29,7 @@ from relbench.tasks import get_task
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--dataset", type=str, default="rel-stack")
-parser.add_argument("--task", type=str, default="user-engagement")
+parser.add_argument("--task", type=str, default="post-votes")
 parser.add_argument("--lr", type=float, default=0.005)
 parser.add_argument("--epochs", type=int, default=20)
 parser.add_argument("--batch_size", type=int, default=512)
@@ -113,6 +113,9 @@ elif task.task_type == TaskType.MULTILABEL_CLASSIFICATION:
     higher_is_better = True
 
 loader_dict: Dict[str, NeighborLoader] = {}
+# Create a mapping for each split's entity table
+entity_table_mapping: Dict[str, str] = {}
+
 for split in ["train", "val", "test"]:
     table = task.get_table(split)
     # For the training split, restrict to the first sample_size rows.
@@ -120,10 +123,12 @@ for split in ["train", "val", "test"]:
         table.df = table.df.iloc[:args.sample_size].reset_index(drop=True)
 
     table_input = get_node_train_table_input(table=table, task=task)
-    entity_table = table_input.nodes[0]
+    # Save the entity table name for this split
+    entity_table_mapping[split] = table_input.nodes[0]
+
     loader_dict[split] = NeighborLoader(
         data,
-        num_neighbors=[int(args.num_neighbors / 2**i) for i in range(args.num_layers)],
+        num_neighbors=[int(args.num_neighbors / 2 ** i) for i in range(args.num_layers)],
         time_attr="time",
         input_nodes=table_input.nodes,
         input_time=table_input.time,
@@ -148,11 +153,11 @@ def train() -> float:
         optimizer.zero_grad()
         pred = model(
             batch,
-            task.entity_table,
+            entity_table_mapping["train"],
         )
         pred = pred.view(-1) if pred.size(1) == 1 else pred
 
-        loss = loss_fn(pred.float(), batch[entity_table].y.float())
+        loss = loss_fn(pred.float(), batch[entity_table_mapping["train"]].y.float())
         loss.backward()
         optimizer.step()
 
@@ -175,7 +180,7 @@ def test(loader: NeighborLoader) -> np.ndarray:
         batch = batch.to(device)
         pred = model(
             batch,
-            task.entity_table,
+            entity_table_mapping["test"],
         )
         if task.task_type == TaskType.REGRESSION:
             assert clamp_min is not None
@@ -211,14 +216,14 @@ def embed(
     y_list = []
     for idx, batch in enumerate(tqdm(loader)):
         batch = batch.to(device)
-        embed = model_embed(
+        embed_out = model_embed(
             batch,
-            task.entity_table,
+            entity_table_mapping["train"],
         )
-        embed_list.append(embed.detach().cpu())
+        embed_list.append(embed_out.detach().cpu())
 
         if not no_label:
-            y = batch[entity_table].y
+            y = batch[entity_table_mapping["train"]].y
             y_list.append(y.detach().cpu())
 
         if stop_at is not None and idx >= stop_at:
@@ -247,7 +252,7 @@ model = Model(
     norm="batch_norm",
 ).to(device)
 
-# Initialize optimizer
+# Initialize optimizer with different LR for different model components
 optimizer = torch.optim.AdamW(
     [
         {"params": model.encoder.parameters(), "lr": args.lr * 0.5},  # Encoder: half LR
@@ -274,9 +279,8 @@ if os.path.exists(STATE_DICT_PTH) and args.attempt_load_state_dict:
     model.load_state_dict(state_dict)
 
 else:
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     state_dict = None
-    best_val_metric = 0 if higher_is_better else math.inf
+    best_val_metric = float('-inf') if higher_is_better else float('inf')
     for epoch in range(1, args.epochs + 1):
         train_loss = train()
         val_pred = test(loader_dict["val"])
@@ -300,12 +304,9 @@ else:
         # Step the scheduler
         scheduler.step()
 
-    # save state dict
-    if args.attempt_load_state_dict:
+    # save state dict if necessary
+    if args.attempt_load_state_dict and state_dict is not None:
         torch.save(state_dict, STATE_DICT_PTH)
-
-val_pred_accum = 0
-test_pred_accum = 0
 
 print("=====================")
 print("GNN model performance")
